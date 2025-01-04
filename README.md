@@ -1,2 +1,2 @@
 # ARB
-The code of the paper AttriReBoost: An Innovative Gradient-Free Missing Attribute Reconstruction Method for Cold Start Mitigation in Graphs
+The code of the paper AttriReBoost: A Gradient-Free Propagation Optimization Method for Cold Start Mitigation in Attribute Missing Graphs 
