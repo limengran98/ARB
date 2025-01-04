@@ -4,7 +4,7 @@ import ar
 def main():
     # EstimationValidator.multi_run("combine_all_le30", max_num_iter=30, early_stop=True, only_val_once= False)
     # EstimationValidator.multi_run("combine_all_eq30", max_num_iter=30, early_stop=False, only_val_once= False)
-    EstimationValidator.multi_run("combine_k10_le30",dataset_names=['product'], max_num_iter=30, early_stop=True)
+    EstimationValidator.multi_run("combine_k10_le30",dataset_names=['cora'], max_num_iter=30, early_stop=True)
     # EstimationValidator.multi_run("combine_k10_eq30", max_num_iter=30, early_stop=False)
     # EstimationValidator.multi_run("combine_k50_le30", max_num_iter=30, early_stop=True, k_index= -1)
     # EstimationValidator.multi_run("combine_k50_eq30", max_num_iter=30, early_stop=False, k_index= -1)
