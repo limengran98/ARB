@@ -88,6 +88,119 @@ class APA:
             self._adj = get_propagation_matrix(self.edge_index, self.n_nodes)
         return self._adj
 
+    @staticmethod
+    def _symmetric_normalize(A: torch.Tensor) -> torch.Tensor:
+        A = A.coalesce()
+        row, col = A.indices()
+        val = A.values()
+        deg = torch.zeros(A.size(0), device=A.device, dtype=A.dtype).index_add_(0, row, val)
+        deg = torch.clamp(deg, min=1e-12)
+        d_inv_sqrt = torch.pow(deg, -0.5)
+        new_val = d_inv_sqrt[row] * val * d_inv_sqrt[col]
+        return torch.sparse_coo_tensor(A.indices(), new_val, size=A.shape, device=A.device, dtype=A.dtype).coalesce()
+
+    @staticmethod
+    def _ensure_symmetric(A: torch.Tensor) -> torch.Tensor:
+        AT = torch.sparse_coo_tensor(A.indices().flip(0), A.values(), A.shape, device=A.device, dtype=A.dtype).coalesce()
+        return (A + AT).coalesce().coalesce() * 0.5
+
+    @staticmethod
+    def _to_sparse(indices, values, size, device, dtype):
+        return torch.sparse_coo_tensor(indices, values, size=size, device=device, dtype=dtype).coalesce()
+
+    # ---------- Virtual edges: builders ----------
+    def _build_virtual_adj_full(self):
+        # Full mode: do not explicitly build a dense fully-connected sparse graph,
+        # use mean channel instead (see umtp_ve)
+        return None
+
+    def _knn_topk(self, X: torch.Tensor, k: int):
+        # Top-k cosine similarity; suitable for small/medium graphs.
+        # For large graphs, consider FAISS / approximate NN
+        Xn = F.normalize(X, p=2, dim=1)
+        S = Xn @ Xn.T  # [N, N]
+        N = Xn.size(0)
+        S.fill_diagonal_(float('-inf'))
+        topv, topi = torch.topk(S, k=k, dim=1)
+        rows = torch.arange(N, device=X.device).unsqueeze(1).expand_as(topi).reshape(-1)
+        cols = topi.reshape(-1)
+        vals = torch.clamp(topv.reshape(-1), min=0)  # keep non-negative
+        return rows, cols, vals, N
+
+    def _build_virtual_adj_knn(self, X: torch.Tensor, k: int):
+        rows, cols, vals, N = self._knn_topk(X, k)
+        A = self._to_sparse(torch.stack([rows, cols], dim=0), vals, (N, N), X.device, X.dtype)
+        A = self._ensure_symmetric(A)
+        return self._symmetric_normalize(A)
+
+    def _build_virtual_adj_thresh(self, X: torch.Tensor, thresh: float):
+        Xn = F.normalize(X, p=2, dim=1)
+        S = Xn @ Xn.T
+        N = Xn.size(0)
+        S.fill_diagonal_(0.0)
+        mask = (S > thresh)
+        idx = mask.nonzero(as_tuple=False).T  # [2, E]
+        if idx.numel() == 0:
+            return torch.sparse_coo_tensor(torch.zeros((2, 0), dtype=torch.long, device=X.device),
+                                           torch.zeros((0,), dtype=X.dtype, device=X.device),
+                                           size=(N, N), device=X.device, dtype=X.dtype).coalesce()
+        vals = torch.clamp(S[idx[0], idx[1]], min=0)
+        A = self._to_sparse(idx, vals, (N, N), X.device, X.dtype)
+        A = self._ensure_symmetric(A)
+        return self._symmetric_normalize(A)
+
+    def _build_virtual_adj_rbf(self, X: torch.Tensor, k: int, sigma: float = None):
+        # RBF-weighted kNN: w_ij = exp(-||x_i - x_j||^2 / (2 sigma^2))
+        rows, cols, cosv, N = self._knn_topk(X, k)  # cosv ~ similarity
+        dist2 = 2 * (1 - torch.clamp(cosv, min=-1, max=1))  # ||a-b||^2 = 2(1 - cos)
+        if sigma is None:
+            finite = dist2[torch.isfinite(dist2) & (dist2 > 0)]
+            sigma = torch.sqrt(torch.median(finite) + 1e-12).item() if finite.numel() > 0 else 1.0
+        w = torch.exp(-dist2 / (2 * (sigma ** 2) + 1e-12))
+        A = self._to_sparse(torch.stack([rows, cols], dim=0), w, (N, N), X.device, X.dtype)
+        A = self._ensure_symmetric(A)
+        return self._symmetric_normalize(A)
+
+    def _build_virtual_adj_random(self, n: int, m_edges: int, seed: int = 0, dtype=None):
+        g = torch.Generator(device=self.out.device)
+        g.manual_seed(seed)
+        i = torch.randint(0, n, (m_edges,), generator=g, device=self.out.device)
+        j = torch.randint(0, n, (m_edges,), generator=g, device=self.out.device)
+        mask = (i != j)
+        i, j = i[mask], j[mask]
+        idx = torch.stack([i, j], dim=0)
+        val = torch.ones(i.numel(), device=self.out.device, dtype=dtype or self.out.dtype)
+        A = self._to_sparse(idx, val, (n, n), self.out.device, dtype or self.out.dtype)
+        A = self._ensure_symmetric(A)
+        return self._symmetric_normalize(A)
+
+    def _build_virtual_adj(self, virtual_mode: str, k: int, sim_thresh: float, rbf_sigma: float, random_edges: int):
+        """
+        Return the sparse adjacency of virtual edges (already symmetrically normalized);
+        in full mode, return None (handled by mean channel).
+        """
+        X = self.x  # use input features for graph construction
+        if virtual_mode == "full":
+            return self._build_virtual_adj_full()
+        elif virtual_mode == "knn":
+            return self._build_virtual_adj_knn(X, k=k)
+        elif virtual_mode == "thresh":
+            return self._build_virtual_adj_thresh(X, thresh=sim_thresh)
+        elif virtual_mode == "rbf":
+            return self._build_virtual_adj_rbf(X, k=k, sigma=rbf_sigma)
+        elif virtual_mode == "random":
+            if random_edges is None:
+                random_edges = max(self.n_nodes * 10, 1000)
+            return self._build_virtual_adj_random(self.n_nodes, random_edges, dtype=self.x.dtype)
+        elif virtual_mode in (None, "none"):
+            return torch.sparse_coo_tensor(torch.zeros((2, 0), dtype=torch.long, device=self.out.device),
+                                           torch.zeros((0,), dtype=self.out.dtype, device=self.out.device),
+                                           size=(self.n_nodes, self.n_nodes),
+                                           device=self.out.device, dtype=self.out.dtype).coalesce()
+        else:
+            raise ValueError(f"Unknown virtual_mode: {virtual_mode}")
+
+
     def fp(self, out: torch.Tensor = None, num_iter: int = 1, **kw) -> torch.Tensor:
         if out is None:
             out = self.out
@@ -192,6 +305,62 @@ class APA:
         out = (self.out - self.mean) / self.std
         out = torch.mm(torch.inverse(L + eta * Ik + theta * L1), eta * torch.mm(Ik, out))
         return out * self.std + self.mean
+
+    def arb_ve( 
+        self,
+        out: torch.Tensor = None,
+        alpha: float = 0.99,
+        beta: float = 0.9,
+        num_iter: int = 20,
+        virtual_mode: str = "full",  # 'full' | 'knn' | 'thresh' | 'rbf' | 'random' | 'none'
+        gamma: float = 1.0,          # weight of the virtual-edge channel (added into the graph)
+        k: int = 10,                 # k for knn/rbf
+        sim_thresh: float = 0.8,     # threshold for 'thresh' mode
+        rbf_sigma: float = None,     # sigma for 'rbf' mode
+        random_edges: int = None     # number of edges for 'random' mode
+    ) -> torch.Tensor:
+        if out is None:
+            out = self.out
+        device, dtype = out.device, out.dtype
+
+        # Standardization
+        out = (out - self.mean) / (self.std + 1e-12)
+
+        # Real graph (assumed to be a symmetrically normalized propagation matrix)
+        A_real = self.adj.coalesce()
+
+        # Build virtual edges
+        A_virtual = self._build_virtual_adj(virtual_mode, k, sim_thresh, rbf_sigma, random_edges)
+
+        # Merge adjacencies & normalize consistently
+        if A_virtual is not None and A_virtual._nnz() > 0 and gamma > 0:
+            if A_virtual.device != A_real.device or A_virtual.dtype != A_real.dtype:
+                A_virtual = torch.sparse_coo_tensor(
+                    A_virtual.indices(),
+                    A_virtual.values().to(device=device, dtype=dtype),
+                    size=A_virtual.shape, device=device, dtype=dtype
+                ).coalesce()
+            A_tot = (A_real + gamma * A_virtual).coalesce()
+            A_tot = self._symmetric_normalize(A_tot)
+            use_fc_mean = False
+        else:
+            A_tot = self._symmetric_normalize(A_real)
+            use_fc_mean = (virtual_mode == "full")
+
+        # Iterative propagation
+        for _ in range(num_iter):
+            prop = torch.sparse.mm(A_tot, out)
+            if use_fc_mean:
+                out = alpha * prop + (1 - alpha) * out.mean(dim=0, keepdim=True)  # full: use the global-mean channel
+            else:
+                # Non-'full': virtual edges already merged into the graph;
+                # alpha=1.0 is recommended (you may keep alpha for ablation/contrast)
+                out = alpha * prop + (1 - alpha) * out.mean(dim=0, keepdim=True)
+            # Reset boundary conditions
+            out[self.know_mask] = beta * out[self.know_mask] + (1 - beta) * self.out_k_init
+
+        # De-standardization
+        return out * (self.std + 1e-12) + self.mean
 
 
 class arbLabel:
