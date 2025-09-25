@@ -1,8 +1,8 @@
 # ARB: AttriReBoost
 
-> The official implementation of **AttriReBoost (ARB)** — a gradient‑free propagation optimization method for mitigating cold‑start issues on **attribute‑missing graphs**.
+### The official implementation of **Attrireboost: A gradient-free propagation optimization method for cold start mitigation in attribute missing graphs**.
 
-This repository provides PyTorch / PyG code to (1) **estimate missing node attributes** by propagation and (2) **evaluate downstream tasks** (classification) on standard graph benchmarks.
+#### This repository provides PyTorch / PyG code to (1) **estimate missing node attributes** by propagation and (2) **evaluate downstream tasks** (classification) on standard graph benchmarks.
 
 ---
 
